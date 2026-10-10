@@ -162,6 +162,21 @@ All hooks are sourced by the generated `AppRun`. Older `.bg.hook` and `.src.hook
 - `QUICK_SHARUN_SKIP_DEPS_FOR` - Space/newline-separated list of library names to skip dependency deployment for (e.g., `libqgtk3.so`). By default `libqgtk3.so` is always included to avoid deploying GTK3 in Qt apps when `QT_QPA_PLATFORMTHEME=fusion` is set.
 - `SKIP_INTEGRITY_CHECKS=1` - Skips the sha256 checks of the files that `quick-sharun` downloads (`sharun`, `appimagetool`, `onelf` and `cross-libc-dlopen`). The checksums are pinned to specific release versions, so if you override any of the `SHARUN_LINK`, `APPIMAGETOOL_LINK`, `ONELF_LINK` or `CROSS_LIBC_DLOPEN_LINK` variables with artifacts that do not match the pinned `*_SHA` values, the build fails unless this is set to `1`.
 
+**Building a package other than an AppImage:**
+
+`OUTPUT_FORMAT` picks what to build from the deployed AppDir, and the `--make-rpm` flag builds one from an AppDir that is already deployed. The bundle of libraries, data and `sharun` is kept intact, so the package keeps the same small size and does not depend on host libraries.
+
+```sh
+export VERSION=1.2.3
+export OUTPUT_FORMAT=rpm
+./quick-sharun /usr/bin/myapp
+```
+
+- `OUTPUT_FORMAT=appimage` - The default, same as `OUTPUT_APPIMAGE=1`.
+- `OUTPUT_FORMAT=rpm` - Installs the portable AppDir to `/opt/<name>`, with a launcher in `/usr/bin`, a `.desktop` file and an icon in `/usr/share`. Requires `rpmbuild` (Arch: `rpm-tools`, Fedora: `rpm-build`).
+
+The name, version, release, prefix and metadata can be overridden with `RPM_NAME`, `RPM_VERSION`, `RPM_RELEASE`, `RPM_PREFIX`, `RPM_SUMMARY`, `RPM_DESCRIPTION`, `RPM_LICENSE` and `RPM_URL`. `deb`, tarball and Arch packages are planned and will use the same `OUTPUT_FORMAT` variable.
+
 -----------------------------------
 
 ### [Back to Index](#index)

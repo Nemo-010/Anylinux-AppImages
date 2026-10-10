@@ -48,6 +48,12 @@ DST_BIN_DIR=$APPDIR/bin
 SHARUN_BIN_DIR=$APPDIR/shared/bin
 MAIN_BIN=${MAIN_BIN##*/}
 OUTPATH=${OUTPATH:-$PWD}
+OUTPUT_FORMAT=${OUTPUT_FORMAT:-}
+
+# OUTPUT_APPIMAGE is the legacy way of asking for an AppImage
+if [ "$OUTPUT_APPIMAGE" = 1 ] && [ -z "$OUTPUT_FORMAT" ]; then
+	OUTPUT_FORMAT=appimage
+fi
 
 ANYLINUX_LIB=${ANYLINUX_LIB:-1}
 OPTIMIZE_LAUNCH=${OPTIMIZE_LAUNCH:-0}
@@ -286,7 +292,21 @@ _help_msg() {
 	  ADD_HOOKS           List of hooks (colon-separated) to deploy with the application.
 	  DESKTOP             Path or URL to a .desktop file to include.
 	  ICON                Path or URL to an icon file to include.
-	  OUTPUT_APPIMAGE     Set to 1 to turn the deployed AppDir into an AppImage.
+	  OUTPUT_FORMAT       Package format to build from the deployed AppDir.
+	                        Supported: appimage, rpm
+	                        (deb, tarball and Arch packages are planned)
+	  OUTPUT_APPIMAGE     Legacy alias for OUTPUT_FORMAT=appimage.
+	  RPM_NAME            Override the RPM package name (default: APPNAME,
+	                        or the Name field of the top level .desktop file).
+	  RPM_VERSION         Override the version used for the RPM (default: VERSION,
+	                        then ~/version, then X-AppImage-Version, then 1.0.0).
+	  RPM_RELEASE         RPM release number (default: 1).
+	  RPM_PREFIX          Prefix the bundled AppDir is installed to
+	                        (default: /opt).
+	  RPM_SUMMARY         RPM summary (default: the .desktop Comment).
+	  RPM_DESCRIPTION     RPM description (default: RPM_SUMMARY).
+	  RPM_LICENSE         RPM license string (default: unknown).
+	  RPM_URL             RPM package URL.
 	  DEPLOY_QT           Set to 1 to force deployment of Qt. Will determine to deploy
 	                        QtWebEngine and Qml as well, these can be controlled with
 	                        DEPLOY_QT_WEB_ENGINE and DEPLOY_QML. Set to 1 enable, 0 disable
@@ -407,10 +427,13 @@ _help_msg() {
 
 	  NOTE:
 	  Several of these options get turned on automatically based on what is being deployed.
+	  Building a non-AppImage package needs the matching tool on the build system:
+	  RPM packages need 'rpmbuild' (Arch: rpm-tools, Fedora: rpm-build).
 
 	  EXAMPLES:
 	  DEPLOY_OPENGL=1 ./quick-sharun.sh /path/to/myapp
 	  DESKTOP=/path/to/app.desktop ICON=/path/to/icon.png ./quick-sharun.sh /path/to/myapp
+	  OUTPUT_FORMAT=rpm ./quick-sharun.sh /path/to/myapp
 	  ADD_HOOKS="self-updater.hook:fix-namespaces.hook" ./quick-sharun.sh /path/to/myapp
 	  STRACE_BINARY=myapp STRACE_FLAGS=https://67.com ./quick-sharun.sh /path/to/myapp
 
@@ -4362,6 +4385,235 @@ _make_static_bin() (
 	_echo "------------------------------------------------------------"
 )
 
+_make_rpm() {
+	_echo "------------------------------------------------------------"
+	_echo "Making RPM package..."
+	_echo "------------------------------------------------------------"
+
+	if [ ! -d "$APPDIR" ]; then
+		_err_msg "ERROR: No $APPDIR directory found"
+		_err_msg "Set APPDIR if you have it at another location"
+		exit 1
+	elif [ ! -f "$APPDIR"/AppRun ]; then
+		_err_msg "ERROR: No $APPDIR/AppRun file found!"
+		exit 1
+	fi
+	_get_desktop
+	_get_icon
+	_sort_env_file
+
+	if ! _is_cmd rpmbuild; then
+		_err_msg "ERROR: rpmbuild is needed to build an RPM but it was not found!"
+		_err_msg "Install the RPM tools first, for example:"
+		_err_msg "  Arch Linux:  pacman -S rpm-tools"
+		_err_msg "  Fedora:      dnf install rpm-build"
+		_err_msg "  openSUSE:    zypper install rpm-build"
+		exit 1
+	fi
+
+	# RPM package names are expected to be lowercase
+	rpm_name=${RPM_NAME:-${APPNAME:-$(awk -F'=' '/^Name=/{print $2; exit}' "$DESKTOP_ENTRY")}}
+	[ -n "$rpm_name" ] || rpm_name=$(awk -F'=| ' '/^Exec=/{print $2; exit}' "$DESKTOP_ENTRY")
+	[ -n "$rpm_name" ] || rpm_name=${MAIN_BIN##*/}
+	rpm_name=$(printf '%s' "$rpm_name" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._+-' '-' \
+	  | sed -e 's/-\{2,\}/-/g' -e 's/^[^a-z0-9]*//' -e 's/[^a-z0-9]*$//')
+	if [ -z "$rpm_name" ]; then
+		_err_msg "ERROR: Could not determine a valid RPM package name!"
+		_err_msg "Set the RPM_NAME environment variable to the wanted name"
+		exit 1
+	fi
+
+	# same version precedence as appimagetool:
+	# VERSION, then ~/version, then the desktop entry, then 1.0.0
+	rpm_version=${RPM_VERSION:-$VERSION}
+	if [ -z "$rpm_version" ] && [ -f "$HOME/version" ]; then
+		rpm_version=$(cat "$HOME/version")
+	fi
+	if [ -z "$rpm_version" ]; then
+		rpm_version=$(awk -F'=' '/^X-AppImage-Version=/{print $2; exit}' "$DESKTOP_ENTRY")
+	fi
+	rpm_version=${rpm_version:-1.0.0}
+	rpm_version=${rpm_version#*:}
+	# appimagetool writes X-AppImage-Version=UNKNOWN when VERSION is not set
+	case "$rpm_version" in
+		UNKNOWN|unknown) rpm_version=;;
+	esac
+	rpm_version=$(printf '%s' "$rpm_version" | tr -c 'a-zA-Z0-9._+~' '.' \
+	  | sed -e 's/^[^a-zA-Z0-9]*//')
+	[ -n "$rpm_version" ] || rpm_version=1.0.0
+
+	rpm_release=$(printf '%s' "${RPM_RELEASE:-1}" | tr -c 'a-zA-Z0-9._+~' '.' \
+	  | sed -e 's/^[^a-zA-Z0-9]*//')
+	[ -n "$rpm_release" ] || rpm_release=1
+
+	case "$APPIMAGE_ARCH" in
+		x86_64|aarch64|riscv64|ppc64|ppc64le|loongarch64)
+			rpm_arch=$APPIMAGE_ARCH
+			;;
+		*)
+			_err_msg "ERROR: Unsupported architecture for RPM: $APPIMAGE_ARCH"
+			exit 1
+			;;
+	esac
+
+	rpm_prefix=${RPM_PREFIX:-/opt}
+	case "$rpm_prefix" in
+		/*) ;;
+		*)
+			_err_msg "ERROR: RPM_PREFIX must be an absolute path!"
+			exit 1
+			;;
+	esac
+	rpm_prefix=${rpm_prefix%/}
+
+	rpm_summary=${RPM_SUMMARY:-$(awk -F'=' '/^Comment=/{print $2; exit}' "$DESKTOP_ENTRY")}
+	[ -n "$rpm_summary" ] || rpm_summary=$rpm_name
+	rpm_description=${RPM_DESCRIPTION:-$rpm_summary}
+	rpm_license=${RPM_LICENSE:-unknown}
+	rpm_url=${RPM_URL:-}
+
+	# '%' starts a macro in spec files, escape it in free text fields
+	rpm_summary=$(printf '%s' "$rpm_summary" | sed 's/%/%%/g')
+	rpm_description=$(printf '%s' "$rpm_description" | sed 's/%/%%/g')
+	rpm_license=$(printf '%s' "$rpm_license" | sed 's/%/%%/g')
+	[ -z "$rpm_url" ] || rpm_url=$(printf '%s' "$rpm_url" | sed 's/%/%%/g')
+
+	_tmpdir=$(mktemp -d "${TMPDIR%/}/qs-rpm.XXXXXX")
+	_tmpdir=$(cd "$_tmpdir" && pwd)
+	trap 'rm -rf "$_tmpdir"' EXIT INT TERM
+	mkdir -p "$_tmpdir"/BUILD "$_tmpdir"/BUILDROOT "$_tmpdir"/RPMS \
+	  "$_tmpdir"/SOURCES "$_tmpdir"/SPECS "$_tmpdir"/SRPMS
+	stage=$_tmpdir/stage
+	mkdir -p "$stage"/usr/bin "$stage"/usr/share/applications
+
+	# desktop entry with Exec/Icon pointing at what the package installs
+	desktop_base=${DESKTOP_ENTRY##*/}
+	icon_field=$(awk -F'=' '/^Icon=/{print $2; exit}' "$DESKTOP_ENTRY")
+	icon_name=${icon_field##*/}
+	icon_ext=
+	case "$icon_name" in
+		*.png)  icon_ext=png;;
+		*.svg)  icon_ext=svg;;
+		*.svgz) icon_ext=svgz;;
+		*.xpm)  icon_ext=xpm;;
+	esac
+	case "$icon_name" in
+		*.png|*.svg|*.svgz|*.xpm) icon_name=${icon_name%.*};;
+	esac
+	[ -n "$icon_name" ] || icon_name=$rpm_name
+	if [ -z "$icon_ext" ]; then
+		# $DIRICON is named .DirIcon, so sniff the contents for the type
+		if grep -qa -m 1 '<svg' "$DIRICON" 2>/dev/null; then
+			icon_ext=svg
+		else
+			icon_ext=png
+		fi
+	fi
+	case "$icon_ext" in
+		svg|svgz) icon_dir=scalable;;
+		*)        icon_dir=256x256;;
+	esac
+	icon_file=$icon_name.$icon_ext
+
+	awk -v exe="$rpm_name" -v icon="$icon_name" '
+		/^Exec=/ { if (!done_exec) { sub(/^Exec=[^ \t]*/, "Exec=" exe); done_exec=1 } print; next }
+		/^Icon=/ { print "Icon=" icon; done_icon=1; next }
+		{ print }
+		END { if (!done_icon) print "Icon=" icon }
+	' "$DESKTOP_ENTRY" > "$stage/usr/share/applications/$desktop_base"
+
+	# relative symlink so the launcher keeps working if the prefix changes
+	launcher_target=$rpm_prefix/$rpm_name/AppRun
+	if _is_cmd realpath; then
+		launcher_rel=$(realpath -m --relative-to="$stage/usr/bin" \
+		  "$stage$rpm_prefix/$rpm_name/AppRun" 2>/dev/null) || :
+		[ -z "$launcher_rel" ] || launcher_target=$launcher_rel
+	fi
+	ln -s "$launcher_target" "$stage/usr/bin/$rpm_name"
+
+	mkdir -p "$stage/usr/share/icons/hicolor/$icon_dir/apps"
+	cp "$DIRICON" "$stage/usr/share/icons/hicolor/$icon_dir/apps/$icon_file"
+
+	{
+		cat <<-EOF
+		%global _binary_payload w19.zstdio
+		%global debug_package %{nil}
+		%global __os_install_post %{nil}
+		%global _build_id_links none
+		%global use_source_date_epoch_as_buildtime 1
+
+		Name:           $rpm_name
+		Version:        $rpm_version
+		Release:        $rpm_release
+		Summary:        $rpm_summary
+		License:        $rpm_license
+		BuildArch:      $rpm_arch
+		AutoReqProv:    no
+		EOF
+		[ -z "$rpm_url" ] || printf 'URL:            %s\n' "$rpm_url"
+		cat <<-EOF
+
+		%description
+		$rpm_description
+
+		%install
+		mkdir -p "\$RPM_BUILD_ROOT$rpm_prefix"
+		cp -a "\$QS_RPM_APPDIR" "\$RPM_BUILD_ROOT$rpm_prefix/$rpm_name"
+		cp -a "\$QS_RPM_STAGE"/. "\$RPM_BUILD_ROOT"/
+
+		%post
+		command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :
+		command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+		exit 0
+
+		%postun
+		command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :
+		command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+		exit 0
+
+		%files
+		%defattr(-, root, root, -)
+		$rpm_prefix/$rpm_name
+		/usr/bin/$rpm_name
+		/usr/share/applications/$desktop_base
+		/usr/share/icons/hicolor/$icon_dir/apps/$icon_file
+		EOF
+	} > "$_tmpdir/SPECS/$rpm_name.spec"
+
+	QS_RPM_APPDIR=$(cd "$APPDIR" && pwd)
+	QS_RPM_STAGE=$stage
+	export QS_RPM_APPDIR QS_RPM_STAGE
+
+	_echo "Running rpmbuild..."
+	if ! rpmbuild -bb --nodeps \
+		--define "_topdir $_tmpdir" \
+		--define "_tmppath $TMPDIR" \
+		--define "_builddir $_tmpdir/BUILD" \
+		--define "_buildrootdir $_tmpdir/BUILDROOT" \
+		"$_tmpdir/SPECS/$rpm_name.spec"
+	then
+		_err_msg "ERROR: rpmbuild failed making the RPM!"
+		exit 1
+	fi
+
+	set -- "$_tmpdir"/RPMS/*/*.rpm
+	if [ ! -f "$1" ]; then
+		_err_msg "ERROR: No RPM was produced??"
+		exit 1
+	fi
+	if ! mkdir -p "$OUTPATH"; then
+		_err_msg "ERROR: Cannot create output directory: '$OUTPATH'"
+		exit 1
+	fi
+	rpm_out=$OUTPATH/${1##*/}
+	cp -f "$1" "$rpm_out"
+
+	_echo "------------------------------------------------------------"
+	_echo "All done! RPM at: $rpm_out"
+	_echo "------------------------------------------------------------"
+	exit 0
+}
+
 _make_appimage() {
 	_echo "------------------------------------------------------------"
 	_echo "Making AppImage..."
@@ -4445,7 +4697,12 @@ case "$1" in
 		_help_msg
 		;;
 	--make-appimage)
+		OUTPUT_FORMAT=appimage
 		_make_appimage
+		;;
+	--make-rpm)
+		OUTPUT_FORMAT=rpm
+		_make_rpm
 		;;
 	--test)
 		shift
@@ -5187,13 +5444,24 @@ if ldd "$DST_LIB_DIR"/libgallium*.so* 2>/dev/null | grep -q 'libLLVM'; then
 fi
 
 echo ""
-if [ "$OUTPUT_APPIMAGE" = 1 ]; then
-	_make_appimage
-else
-	_sort_env_file
-	_ELAPSED=$(( $(date +%s) - _START_TIME )) || :
-	_echo "------------------------------------------------------------"
-	_echo "All done!"
-	_echo "Time taken: $(( _ELAPSED / 60 ))m $(( _ELAPSED % 60 ))s"
-	_echo "------------------------------------------------------------"
-fi
+case "$OUTPUT_FORMAT" in
+	appimage)
+		_make_appimage
+		;;
+	rpm)
+		_make_rpm
+		;;
+	'')
+		_sort_env_file
+		_ELAPSED=$(( $(date +%s) - _START_TIME )) || :
+		_echo "------------------------------------------------------------"
+		_echo "All done!"
+		_echo "Time taken: $(( _ELAPSED / 60 ))m $(( _ELAPSED % 60 ))s"
+		_echo "------------------------------------------------------------"
+		;;
+	*)
+		_err_msg "ERROR: Unknown OUTPUT_FORMAT '$OUTPUT_FORMAT'!"
+		_err_msg "Supported formats are: appimage, rpm"
+		exit 1
+		;;
+esac
