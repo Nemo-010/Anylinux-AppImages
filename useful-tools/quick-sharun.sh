@@ -2005,6 +2005,43 @@ _lib4bin_deploy_binaries() {
 	rm -f "$_seen"
 }
 
+# libssl.so.3 NEEDs libcrypto.so.3, but libcrypto.so.3 does not NEED
+# libssl.so.3, so libcrypto is commonly deployed on its own as a transitive
+# dependency (libssh, libsrt, _hashlib...) while libssl is not.
+#
+# That half state is worse than deploying neither: the host libssl then binds
+# to the bundled libcrypto, and if the host OpenSSL is newer the load fails.
+# Fedora's libssl.so.3 needs OPENSSL_3.0.1, which Arch's libcrypto never
+# defines, so `import ssl` died with:
+#
+#   version `OPENSSL_3.0.1' not found (required by /usr/lib64/libssl.so.3)
+#
+# Deploy both or neither. When libcrypto is already being deployed the pair is
+# only ~1 MiB, so bundle libssl too instead of leaving a time bomb in the app.
+_lib4bin_pair_openssl() {
+	c=""
+	for l in $all_libs; do
+		case "${l##*/}" in
+			libssl.so.*) return 0;;
+			libcrypto.so.*) c=$l;;
+		esac
+	done
+
+	[ -n "$c" ] || return 0
+
+	for l in "$LIB_DIR"/libssl.so.*; do
+		[ -f "$l" ] || continue
+		_is_elf "$l"     || continue
+		# match the ELF class of the libcrypto that was collected
+		if _is_elf64 "$l" && ! _is_elf64 "$c"; then continue; fi
+		if ! _is_elf64 "$l" && _is_elf64 "$c"; then continue; fi
+
+		all_libs=$(printf '%s\n%s' "$all_libs" "$l" | sort -u | sed '/^$/d')
+		_echo "* libcrypto is deployed, adding $l to complete the OpenSSL pair"
+		break
+	done
+}
+
 _lib4bin_main() {
 	_echo "Collecting dependencies..."
 	ldd_libs=$(_lib4bin_collect_ldd "$@")
@@ -2015,6 +2052,8 @@ _lib4bin_main() {
 	fi
 
 	all_libs=$(printf '%s\n%s' "$ldd_libs" "$STRACED_LIBS" | sort -u | sed '/^$/d')
+
+	_lib4bin_pair_openssl
 
 	_echo "Deploying shared libraries..."
 	_lib4bin_deploy_shared_libs $all_libs
