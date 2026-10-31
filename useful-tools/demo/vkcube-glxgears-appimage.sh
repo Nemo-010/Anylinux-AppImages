@@ -9,6 +9,9 @@ SHARUN="https://raw.githubusercontent.com/${GITHUB_REPOSITORY%/*}/${GITHUB_REPOS
 AUR="https://raw.githubusercontent.com/${GITHUB_REPOSITORY%/*}/${GITHUB_REPOSITORY#*/}/refs/heads/main/useful-tools/make-aur-package.sh"
 EXTRA_PACKAGES="https://raw.githubusercontent.com/${GITHUB_REPOSITORY%/*}/${GITHUB_REPOSITORY#*/}/refs/heads/main/useful-tools/get-debloated-pkgs.sh"
 
+# Use the mesa packages built from github.com/pkgforge-dev/archlinux-pkgs-debloated/pull/100
+export SOURCE=https://api.github.com/repos/Nemo-010/archlinux-pkgs-debloated/releases/tags/mesa-size-patches
+
 export DEPLOY_OPENGL=1
 export DEPLOY_VULKAN=1
 export ICON=DUMMY
